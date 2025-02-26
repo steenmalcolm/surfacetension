@@ -1,0 +1,30 @@
+# ---------------------------------------
+# pyproject.toml for "surface_tension"
+# ---------------------------------------
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "surfacetension"
+version = "0.1.0"
+description = "Compute the surface tension for 3 component systems."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name="Malcolm Steen", email="malcolm.steen@stud.uni-goettingen.de" }
+]
+keywords = ["example", "surface_tension"]
+classifiers = [
+  "Programming Language :: Python :: 3"
+]
+requires-python = ">=3.7"
+
+[project.optional-dependencies]
+dev = [
+  "pytest >= 6.0.0",
+]
+docs = [
+  "sphinx",
+]
