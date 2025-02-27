@@ -6,22 +6,28 @@ from surfacetension import NCompSimulator
 
 
 class PostProcessor:
+
     def __init__(self, raw_data_fp: str):
         self.datasets = self.fetch_data(raw_data_fp)
-        self.x_list = NCompSimulator.X_LIST.copy()
 
-        # Get spinodal for all datasets
+        # Iterate over all datasets which vary in interaction strengths
         for chis, dataset in self.datasets.items():
-            sim_obj = NCompSimulator(chis[0], chis[1], raw_data_fp)
-            phi_r, phi_d_dil, phi_d_den = sim_obj.spinodal_from_phi_r()
 
-            dataset["sim_obj"] = sim_obj
+            # Get simulator object to calculate thermodynamic quantities
+            # Chis are off by a factor of 10 for readability
+            dataset["sim_obj"] = NCompSimulator(
+                -chis[0] / 10, chis[1] / 10, raw_data_fp
+            )
+            phi_r, phi_d_dil, phi_d_den = dataset["sim_obj"].spinodal_from_phi_r()
 
+            # Spinodal
             dataset["spinodal"] = {
                 "phi_r": phi_r,
                 "phi_d_dil": phi_d_dil,
                 "phi_d_den": phi_d_den,
             }
+            # Phase concentrations in dilute and dense phase
+            dataset["phase_phis"] = self.get_phase_phis(chis)
 
             surf_ten, del_f, surf_exc = self.calc_surface_tension_from_dataset(chis)
             dataset["surface_tension"] = surf_ten
@@ -30,7 +36,7 @@ class PostProcessor:
 
     def interp_if_pos(self, phi_eq: np.ndarray, x: np.ndarray) -> tuple[float, float]:
         """
-        Return the concentration and position of the interface
+        Interpolate the position of the interface.
 
         Parameters
         ----------
@@ -54,10 +60,26 @@ class PostProcessor:
 
         return (x_if, phi_if)
 
+    def get_phase_phis(self, chis: tuple[float, float]):
+        """
+        Get the concentrations in the dilute and dense phase.
+        """
+
+        prof_eq = self.datasets[chis]["prof_eq"]
+        phase_phis = {
+            "phi_d_dil": prof_eq[:, 0, 0],
+            "phi_d_den": prof_eq[:, 0, -1],
+            "phi_r_dil": prof_eq[:, 1, 0],
+            "phi_r_den": prof_eq[:, 1, -1],
+        }
+
+        return phase_phis
+
     def calc_surface_tension_from_dataset(
         self, chis: tuple[float, float]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Calculte the difference between hard and soft interface free energy for dataset.
+        """Calculte the difference free energy, surface excess
+        and from this the surface tension.
 
         Parameters
         ----------
@@ -81,56 +103,69 @@ class PostProcessor:
         surface_excess = np.zeros(prof_eq.shape[0])
         surface_tension = np.zeros(prof_eq.shape[0])
 
-        # Iterate over samples for different mean regulator concentrations
+        # Iterate over samples for increasing mean regulator concentrations
         for i, prof_eq_sample in enumerate(prof_eq):
 
-            _, x_if = self.interp_if_pos(prof_eq_sample[0], sim_obj.X_LIST)
+            # In general use `NCompSimulator` class for constant system parameters
+            # and class instance `sim_obj` for everything else
+            _, x_if = self.interp_if_pos(prof_eq_sample[0], NCompSimulator.X_LIST)
 
             field_collection = pde.FieldCollection(
-                [pde.ScalarField(sim_obj.GRID, prof_eq_sample[i]) for i in range(2)]
+                [
+                    pde.ScalarField(NCompSimulator.GRID, prof_eq_sample[i])
+                    for i in range(2)
+                ]
             )
 
-            # Compute free energy of the system with gradient terms
-            f_si = sim_obj.EQ.free_energy(field_collection)
+            ###################################
+            # FREE ENERGY
+            ###################################
+            # Soft interface free energy
+            f_si = sim_obj.pde.free_energy(field_collection)
 
-            # Compute the free energy the hard interface limit
+            # Hard interface free energy
             #                                   Concentrations in dilute phase
-            f_hi = x_if * sim_obj.F.free_energy(prof_eq_sample[:, 0]) + (
-                sim_obj.X_LIST[-1]
+            f_hi = x_if * sim_obj.f.free_energy(prof_eq_sample[:, 0]) + (
+                NCompSimulator.X_LIST[-1]
                 - x_if
                 #                     Concentrations in dense phase
-            ) * sim_obj.F.free_energy(prof_eq_sample[:, -1])
+            ) * sim_obj.f.free_energy(prof_eq_sample[:, -1])
 
             del_free_energies[i] = f_si - f_hi
 
-            # Calculate the surface excess
-            NCompSimulator.EQ.chemical_potential(field_collection)
+            ###################################
+            # SURFACE EXCESS
+            ###################################
+            sim_obj.pde.chemical_potential(field_collection)
             chem_pot = np.mean(
-                sim_obj.EQ.chemical_potential(field_collection).data, axis=-1
+                sim_obj.pde.chemical_potential(field_collection).data, axis=-1
             )
 
-            phi_si_d = prof_eq_sample[0].sum() * sim_obj.L / sim_obj.N
-            phi_si_r = prof_eq_sample[1].sum() * sim_obj.L / sim_obj.N
+            phi_si_d = prof_eq_sample[0].sum() * NCompSimulator.L / NCompSimulator.N
+            phi_si_r = prof_eq_sample[1].sum() * NCompSimulator.L / NCompSimulator.N
 
             phi_hi_d = prof_eq_sample[0][0] * x_if + prof_eq_sample[0][-1] * (
-                sim_obj.L - x_if
+                NCompSimulator.L - x_if
             )
             phi_hi_r = prof_eq_sample[1][0] * x_if + prof_eq_sample[1][-1] * (
-                sim_obj.L - x_if
+                NCompSimulator.L - x_if
             )
 
             surface_excess[i] = (phi_si_d - phi_hi_d) * chem_pot[0] + (
                 phi_si_r - phi_hi_r
             ) * chem_pot[1]
 
-            # Calculate the surface tension
+            ###################################
+            # SURFACE TENSION
+            ###################################
             surface_tension[i] = del_free_energies[i] - surface_excess[i]
 
         return surface_tension, del_free_energies, surface_excess
 
     def fetch_data(self, raw_data_dir: str):
         """
-        Extract all unique (dr, ds) pairs from filenames in the given directory.
+        Extract all unique (chi_dr, chi_ds) pairs from filenames in the given directory.
+        Then load the corresponding datasets.
 
         Parameters
         ----------
@@ -161,26 +196,17 @@ class PostProcessor:
         return datasets
 
 
-def compute_free_energy(fields: np.ndarray, p: int = 1) -> float:
-    assert (
-        fields.shape[0] == 2
-    ), f"`fields` needs to have shape (2, N) not {fields.shape}"
+if __name__ == "__main__":
 
-    c_d, c_r = fields
+    import matplotlib.pyplot as plt
 
-    field_collection = pde.FieldCollection(
-        [pde.ScalarField(GRID, fields[i]) for i in range(2)]
-    )
-    # Compute free energy of the system with surface tension
+    post_proc = PostProcessor("data/raw_data")
+    print(post_proc.datasets[(0, 0)]["surface_tension"])
+    # Plot the surface tension for all datasets
+    for dataset in post_proc.datasets.values():
+        plt.plot(
+            dataset["surface_tension"],
+            label=f"chi_dr = {dataset['chi_dr']}, chi_ds = {dataset['chi_ds']}",
+        )
 
-    f_sil = EQ.free_energy(field_collection)
-
-    # Compute the free energy the hard interface limit
-    x_if_d, _ = pos_if(c_d, X_LIST)
-    x_if_r, _ = pos_if(c_r, X_LIST)
-    x_if = p * x_if_d + (1 - p) * x_if_r
-    f_hil = x_if * F.free_energy(fields[:, 0]) + (
-        X_LIST[-1] + X_LIST[1] - X_LIST[0] - x_if  # Right border of grid minus x_if
-    ) * F.free_energy(fields[:, -1])
-
-    return f_sil - f_hil
+    plt.xlabel

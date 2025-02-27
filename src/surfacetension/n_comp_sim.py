@@ -167,8 +167,8 @@ class NCompSimulator:
         Find the critical concentration of the regulator
         """
 
-        def cp(vars):
-            phi_r = vars[0]
+        def cp(args):
+            phi_r = args[0]
             q = 1 / (phi_r * (self.chi_dr - self.chi_ds) ** 2 + 2 * self.chi_ds)
             p = phi_r - 1 - 2 * self.chi_dr * phi_r * q
 
@@ -228,8 +228,8 @@ class NCompSimulator:
             return self.profile_eq[i]
 
         # Choose point near spinodal
-        phi_d_den = self.phi_d_den_spin[i] * 1.001
-        phi_d_dil = self.phi_d_dil_spin[i] * 0.999
+        phi_d_den = self.phi_d_den_spin[i]  # * 1.001
+        phi_d_dil = self.phi_d_dil_spin[i]  # * 0.999
         phi_r = self.phi_r_spin[i]
 
         droplet_data = np.ones(self.N) * phi_d_dil
