@@ -64,9 +64,7 @@ class NCompSimulator:
         )
 
         # Good starting concentrations for the simulations near the spinodal
-        self.phi_r_spin, self.phi_d_dil_spin, self.phi_d_den_spin = (
-            self.spinodal_from_phi_r()
-        )
+        self.phi_r_spin, self.phi_d_dil_spin, self.phi_d_den_spin = self.calc_spinodal()
 
         # File path to save the simulation data
         self.out_prof_eq = os.path.join(
@@ -130,7 +128,7 @@ class NCompSimulator:
                     f"Finished simulation {i+1}/{len(self.phi_r_spin)} in {time.perf_counter()-n:.2f} s"
                 )
 
-    def spinodal_from_phi_r(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def calc_spinodal(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Calculate the spinodal curve which depends on the interaction parameter
 
@@ -144,7 +142,7 @@ class NCompSimulator:
         phi_r_c = self.find_phi_r_c()
 
         # Higher resolution close to the critical point
-        phi_r = phi_r_c - np.exp(np.linspace(np.log(1e-3), np.log(0.02), 11))[::-1]
+        phi_r = phi_r_c - np.exp(np.linspace(np.log(1e-4), np.log(0.01), 11))[::-1]
         phi_r = np.append(np.linspace(0.01, phi_r[0], 20)[:-1], phi_r)
 
         # Calculate droplet concentrations in dilute and dense phase

@@ -18,7 +18,7 @@ class PostProcessor:
             dataset["sim_obj"] = NCompSimulator(
                 -chis[0] / 10, chis[1] / 10, raw_data_fp
             )
-            phi_r, phi_d_dil, phi_d_den = dataset["sim_obj"].spinodal_from_phi_r()
+            phi_r, phi_d_dil, phi_d_den = dataset["sim_obj"].calc_spinodal()
 
             # Spinodal
             dataset["spinodal"] = {

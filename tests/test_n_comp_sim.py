@@ -34,8 +34,8 @@ def test_get_state_init(my_simulator: NCompSimulator):
     assert np.all(state_init == my_simulator.profile_eq[0])
 
 
-def test_spinodal_from_phi_r(my_simulator: NCompSimulator):
-    phi_r, phi_d_dil, phi_d_den = my_simulator.spinodal_from_phi_r()
+def test_calc_spinodal(my_simulator: NCompSimulator):
+    phi_r, phi_d_dil, phi_d_den = my_simulator.calc_spinodal()
     assert phi_r.shape == phi_d_den.shape == phi_d_dil.shape
     assert np.all(phi_d_den > phi_d_dil)
     assert np.all(phi_d_dil > 0)
@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 chi_ds = 2.5
 for chi_dr in np.linspace(0.01, 1.5, 3):
     sim = NCompSimulator(chi_dr, chi_ds, "")
-    phi_r, phi_d_dil, phi_d_den = sim.spinodal_from_phi_r()
+    phi_r, phi_d_dil, phi_d_den = sim.calc_spinodal()
 
     plt.scatter(phi_r, phi_d_dil, color="red")
     plt.scatter(phi_r, phi_d_den, color="blue")
