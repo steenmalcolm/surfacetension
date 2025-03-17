@@ -11,6 +11,7 @@ import scipy
 import pde
 import matplotlib.pyplot as plt
 import phasesep
+import flory
 
 
 class NCompSimulator:
@@ -27,7 +28,7 @@ class NCompSimulator:
     CONV_VALUE = [1e-10, 1e-10]  # MSD must be below this value for convergence
 
     def __init__(
-        self, chi_dr: float, chi_ds: float, out_dir_path: str, verbose: bool = False
+        self, chi_dr: float, chi_ds: float, out_dir: str, verbose: bool = False
     ):
         """
         This class simulates the three component system for a set of interaction parameters.
@@ -48,31 +49,41 @@ class NCompSimulator:
 
         self.chi_dr = chi_dr
         self.chi_ds = chi_ds
-        chi_matrix = np.array(
+        self.chi_matrix = np.array(
             [[0, chi_dr, chi_ds], [chi_dr, 0, 0], [chi_ds, 0, 0]], dtype=float
         )
 
-        self.f = phasesep.FloryHugginsNComponents(chis=chi_matrix, num_comp=3)
+        self.f = phasesep.FloryHugginsNComponents(chis=self.chi_matrix, num_comp=3)
 
         self.pde = phasesep.CahnHilliardMultiplePDE(
             {
                 "free_energy": self.f,
-                "kappa": self.LMD * chi_matrix,
+                "kappa": self.LMD * self.chi_matrix,
                 "regularize_after_step": True,
                 "mobility_model": "scaled_correct",
             }
         )
 
         # Good starting concentrations for the simulations near the spinodal
-        self.phi_r_spin, self.phi_d_dil_spin, self.phi_d_den_spin = self.calc_spinodal()
+        self.phi_d_den_spin, self.phi_d_dil_spin, self.phi_r_spin = self.calc_spinodal()
 
         # File path to save the simulation data
+        os.makedirs(os.path.join(out_dir, "sim_results"), exist_ok=True)
         self.out_prof_eq = os.path.join(
-            out_dir_path, f"profEq_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy"
+            out_dir,
+            "sim_results",
+            f"profEq_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy",
         )
         # File path for average absolute difference of the profiles
         self.out_msd = os.path.join(
-            out_dir_path, f"msd_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy"
+            out_dir, "sim_results", f"msd_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy"
+        )
+        # Cache binodal data for the given interaction parameters
+        os.makedirs(os.path.join(out_dir, "binodals"), exist_ok=True)
+        self.out_binod = os.path.join(
+            out_dir,
+            "binodals",
+            f"dr{abs(self.chi_dr*10):.0f}_ds{self.chi_ds*10:.0f}.npy",
         )
 
         if os.path.exists(self.out_prof_eq):
@@ -91,13 +102,15 @@ class NCompSimulator:
 
         t_sim = self.T_SIM
 
-        for i in range(len(self.phi_r_spin)):
+        binodal_phis = self.calc_binodal()
+
+        for i, phis_init in enumerate(binodal_phis):
 
             n = time.perf_counter()
             # Prevent getting stuck in a non-converging simulation
             failed_conv_count = 0
 
-            state_init = self.get_state_init(i)
+            state_init = self.get_state_init(phis_init)
 
             while True:
                 profile_t = self.evolve(state_init, t_sim)
@@ -158,7 +171,43 @@ class NCompSimulator:
         phi_d_den = phi_d_den[real_idx]
         phi_d_dil = phi_d_dil[real_idx]
 
-        return phi_r, phi_d_dil, phi_d_den
+        return phi_d_den, phi_d_dil, phi_r
+
+    def calc_binodal(self) -> np.ndarray:
+        """
+        Calculate the binodal curve which depends on the interaction parameter
+
+        Returns
+        -------
+        np.ndarray
+            Binodal concentrations of the droplet and regulator in dense and dilute phase
+        """
+        num_comp = 3  # Set number of components
+
+        if os.path.exists(self.out_binod):
+            print("Debug: Shouldn't be here")
+            return np.load(self.out_binod)
+
+        binodal_phis = []
+
+        # Obtain coexisting phases
+        for i, phi_r in enumerate(self.phi_r_spin):
+            phi_d = 0.5 * (self.phi_d_dil_spin[i] + self.phi_d_den_spin[i])
+            phi_means = [
+                phi_d,
+                phi_r,
+                1 - phi_r - phi_d,
+            ]  # Set the average volume fractions
+            phases = flory.find_coexisting_phases(num_comp, self.chi_matrix, phi_means)
+            fracs = phases.fractions
+
+            if len(fracs) == 2:
+                binodal_phis.append(fracs[:, :2].flatten())
+
+        # Binodals has order (phi_d_den, phi_r_den, phi_d_dil, phi_r_dil)
+        binodal_phis = np.array(binodal_phis)
+        np.save(self.out_binod, binodal_phis)
+        return binodal_phis
 
     def find_phi_r_c(self) -> float:
         """
@@ -207,32 +256,26 @@ class NCompSimulator:
 
         return storage.data
 
-    def get_state_init(self, i: int) -> np.ndarray:
+    def get_state_init(self, phis_init: np.ndarray) -> np.ndarray:
         """
         Get the initial state for the simulation.
-        The droplet profile has a step function and the regulator profile is constant
 
         Parameters
         ----------
-        i : int
-            Index of the simulation
+        phis_init : np.ndarray
+            Initial concentrations of the droplet and regulator in dense and dilute phase
 
         Returns
         -------
         np.ndarray
             Initial state of the simulation | shape (2, N)
         """
-        if self.is_cp_data:
-            return self.profile_eq[i]
 
-        # Choose point near spinodal
-        phi_d_den = self.phi_d_den_spin[i]  # * 1.001
-        phi_d_dil = self.phi_d_dil_spin[i]  # * 0.999
-        phi_r = self.phi_r_spin[i]
+        droplet_data = np.ones(self.N) * phis_init[2]
+        droplet_data[self.N // 2 :] = phis_init[0]  # Step function
 
-        droplet_data = np.ones(self.N) * phi_d_dil
-        droplet_data[self.N // 2 :] = phi_d_den  # Step function
-        regulator_data = np.ones(self.N) * phi_r
+        regulator_data = np.ones(self.N) * phis_init[3]
+        regulator_data[self.N // 2 :] = phis_init[1]
 
         return np.array([droplet_data, regulator_data])
 
@@ -259,3 +302,8 @@ class NCompSimulator:
         if np.all(np.any(prof_rel_diff_t < self.CONV_VALUE, axis=0)):
             return prof_rel_diff_t.T
         return None
+
+
+if __name__ == "__main__":
+    my_sim = NCompSimulator(-0.5, 2.5, "data", verbose=True)
+    my_sim.run()
