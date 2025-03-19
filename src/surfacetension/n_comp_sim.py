@@ -25,7 +25,7 @@ class NCompSimulator:
     # Simulation parameters
     T_SIM = 1000000
     NUM_FRAMES = 100  # Number of frames during the simulation
-    CONV_VALUE = [1e-10, 1e-10]  # MSD must be below this value for convergence
+    CONV_VALUE = [1e-9, 1e-9]  # MSD must be below this value for convergence
 
     def __init__(
         self, chi_dr: float, chi_ds: float, out_dir: str, verbose: bool = False
@@ -86,23 +86,15 @@ class NCompSimulator:
             f"dr{abs(self.chi_dr*10):.0f}_ds{self.chi_ds*10:.0f}.npy",
         )
 
-        if os.path.exists(self.out_prof_eq):
-            self.profile_eq = np.load(self.out_prof_eq)
-            self.msd_t = np.load(self.out_msd)
-            self.is_cp_data = True  # Checkpoint data
-
-        else:
-            # Save the equilibrium profiles
-            self.profile_eq = np.zeros((len(self.phi_r_spin), 2, self.N))
-            self.msd_t = np.zeros((len(self.phi_r_spin), 2, self.NUM_FRAMES))
-            self.is_cp_data = False
-
     def run(self):
         """Compute the binodal curve by simulating the system at different initial concentrations"""
 
         t_sim = self.T_SIM
 
         binodal_phis = self.calc_binodal()
+
+        self.profile_eq = np.zeros((len(binodal_phis), 2, self.N))
+        self.msd_t = np.zeros((len(binodal_phis), 2, self.NUM_FRAMES))
 
         for i, phis_init in enumerate(binodal_phis):
 
@@ -138,7 +130,7 @@ class NCompSimulator:
 
             if self.verbose:
                 print(
-                    f"Finished simulation {i+1}/{len(self.phi_r_spin)} in {time.perf_counter()-n:.2f} s"
+                    f"Finished simulation {i+1}/{len(binodal_phis)} in {time.perf_counter()-n:.2f} s"
                 )
 
     def calc_spinodal(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -148,7 +140,7 @@ class NCompSimulator:
         Returns
         -------
         tuple[np.ndarray, np.ndarray, np.ndarray]
-            phi_r, phi_d_den, phi_d_dil
+            phi_d_den, phi_d_dil, phi_r
         """
 
         # Higher resolution at low phi_r and critical point
@@ -185,7 +177,6 @@ class NCompSimulator:
         num_comp = 3  # Set number of components
 
         if os.path.exists(self.out_binod):
-            print("Debug: Shouldn't be here")
             return np.load(self.out_binod)
 
         binodal_phis = []
