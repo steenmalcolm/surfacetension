@@ -117,9 +117,7 @@ class PostProcessor:
             # Hard interface free energy
             #                                   Concentrations in dilute phase
             f_hi = x_if * sim_obj.f.free_energy(prof_eq_sample[:, 0]) + (
-                NCompSimulator.X_LIST[-1]
-                + NCompSimulator.X_LIST[1]
-                - NCompSimulator.X_LIST[0]
+                NCompSimulator.L
                 - x_if
                 #                     Concentrations in dense phase
             ) * sim_obj.f.free_energy(prof_eq_sample[:, -1])
@@ -328,13 +326,13 @@ class PostProcessor:
         plt.ylabel(r"$\delta$")
         plt.title(r"$\gamma \propto (\phi_r - \phi_{r,dil})^{\delta}$")
 
-        plt.savefig("crit_exp.png")
-        # plt.show()
+        # plt.savefig("crit_exp.png")
+        plt.show()
 
 
 if __name__ == "__main__":
 
     post_proc = PostProcessor("data")
-    # post_proc.plot_surface_tension()
-    # post_proc.plot_fit_params()
-    post_proc.plot_profiles((8, 30))
+    post_proc.plot_surface_tension()
+    post_proc.plot_fit_params()
+    # post_proc.plot_profiles((8, 30))
