@@ -9,7 +9,7 @@ import scipy
 
 
 import pde
-import matplotlib.pyplot as plt
+from surfacetension.utils import mute_stdout
 import phasesep
 import flory
 
@@ -19,8 +19,8 @@ class NCompSimulator:
     L = 400
     N = 128
     LMD = -4
-    X_LIST = np.linspace(0, L, N + 1)[:-1]
     GRID = pde.CartesianGrid([(0, L)], [N], periodic=False)
+    X_LIST = GRID.cell_coords.flatten()
 
     # Simulation parameters
     T_SIM = 1000000
@@ -55,14 +55,15 @@ class NCompSimulator:
 
         self.f = phasesep.FloryHugginsNComponents(chis=self.chi_matrix, num_comp=3)
 
-        self.pde = phasesep.CahnHilliardMultiplePDE(
-            {
-                "free_energy": self.f,
-                "kappa": self.LMD * self.chi_matrix,
-                "regularize_after_step": True,
-                "mobility_model": "scaled_correct",
-            }
-        )
+        with mute_stdout():
+            self.pde = phasesep.CahnHilliardMultiplePDE(
+                {
+                    "free_energy": self.f,
+                    "kappa": self.LMD * self.chi_matrix,
+                    "regularize_after_step": True,
+                    "mobility_model": "scaled_correct",
+                }
+            )
 
         # Good starting concentrations for the simulations near the spinodal
         self.phi_d_den_spin, self.phi_d_dil_spin, self.phi_r_spin = self.calc_spinodal()
@@ -133,6 +134,31 @@ class NCompSimulator:
                     f"Finished simulation {i+1}/{len(binodal_phis)} in {time.perf_counter()-n:.2f} s"
                 )
 
+    def calc_phi_d_spin_phi_r(
+        self, phi_r: float, is_dense_phase: bool = False
+    ) -> float:
+        """
+        Calculate the spinodal droplet concentration as a function of the regulator concentration
+
+        Parameters
+        ----------
+        phi_r : float
+            Regulator concentration
+        is_dense_phase : bool, optional
+            Calculate the droplet concentration in the dense phase, by default False
+
+        Returns
+        -------
+        float
+            Droplet concentration
+        """
+        q = 1 / (phi_r * (self.chi_dr - self.chi_ds) ** 2 + 2 * self.chi_ds)
+        p = phi_r - 1 - 2 * self.chi_dr * phi_r * q
+
+        if is_dense_phase:
+            return -p / 2 + np.sqrt(p**2 / 4 - q)
+        return -p / 2 - np.sqrt(p**2 / 4 - q)
+
     def calc_spinodal(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Calculate the spinodal curve which depends on the interaction parameter
@@ -151,11 +177,8 @@ class NCompSimulator:
         phi_r = np.append(np.linspace(0.01, phi_r[0], 20)[:-1], phi_r)
 
         # Calculate droplet concentrations in dilute and dense phase
-        q = 1 / (phi_r * (self.chi_dr - self.chi_ds) ** 2 + 2 * self.chi_ds)
-        p = phi_r - 1 - 2 * self.chi_dr * phi_r * q
-
-        phi_d_den = -p / 2 + np.sqrt(p**2 / 4 - q)
-        phi_d_dil = -p / 2 - np.sqrt(p**2 / 4 - q)
+        phi_d_den = self.calc_phi_d_spin_phi_r(phi_r, is_dense_phase=True)
+        phi_d_dil = self.calc_phi_d_spin_phi_r(phi_r, is_dense_phase=False)
 
         # Remove imaginary solutions
         real_idx = phi_d_dil > 0
@@ -174,29 +197,58 @@ class NCompSimulator:
         np.ndarray
             Binodal concentrations of the droplet and regulator in dense and dilute phase
         """
-        num_comp = 3  # Set number of components
 
         if os.path.exists(self.out_binod):
             return np.load(self.out_binod)
 
-        binodal_phis = []
+        binodal_phis = np.empty((0, 4))
 
-        # Obtain coexisting phases
-        for i, phi_r in enumerate(self.phi_r_spin):
-            phi_d = 0.5 * (self.phi_d_dil_spin[i] + self.phi_d_den_spin[i])
-            phi_means = [
-                phi_d,
-                phi_r,
-                1 - phi_r - phi_d,
-            ]  # Set the average volume fractions
-            phases = flory.find_coexisting_phases(num_comp, self.chi_matrix, phi_means)
+        fh = flory.FloryHuggins(3, self.chi_matrix)
+
+        ensemble = flory.CanonicalEnsemble(3)
+        finder = flory.CoexistingPhasesFinder(
+            fh.interaction, fh.entropy, ensemble, progress=self.verbose
+        )
+
+        l = 0.02  # Step size between binodal points
+        count = 0
+        while True:
+            if count == 0:
+                phi_d = 0.5 * (self.phi_d_dil_spin[0] + self.phi_d_den_spin[0])
+                phi_r = self.phi_r_spin[0]
+                ensemble.phi_means = [phi_d, phi_r, 1 - phi_r - phi_d]
+
+            else:
+                # coordinates in dense and dilute phase of most recent binodal
+                p2, p1 = binodal_phis[-1].reshape(2, 2)
+
+                # Center of tide line
+                v_0 = 1 / 2 * (p1 + p2)
+                # Vector parallel to tide line; pointing to dense phase
+                v_pl = p2 - p1
+                # Vector orthogonal to tide line
+                v_orth = np.array([-v_pl[1], v_pl[0]])
+                phis_next = v_0 + l * v_orth
+                ensemble.phi_means = [*phis_next, 1 - phis_next.sum()]
+
+            finder.set_ensemble(ensemble)
+            phases = finder.run().get_clusters()
+
             fracs = phases.fractions
 
+            fracs = fracs[np.argsort(fracs[:, 0])[::-1]]  # Dense phase first
+
             if len(fracs) == 2:
-                binodal_phis.append(fracs[:, :2].flatten())
+                binodal_phis = np.vstack([binodal_phis, fracs[:, :2].reshape(1, -1)])
+
+            elif len(fracs) == 1:
+                if l < 1e-3:
+                    break
+                l *= 0.5
+
+            count += 1
 
         # Binodals has order (phi_d_den, phi_r_den, phi_d_dil, phi_r_dil)
-        binodal_phis = np.array(binodal_phis)
         np.save(self.out_binod, binodal_phis)
         return binodal_phis
 
@@ -296,5 +348,20 @@ class NCompSimulator:
 
 
 if __name__ == "__main__":
-    my_sim = NCompSimulator(-0.5, 2.5, "data", verbose=True)
-    my_sim.run()
+    import matplotlib.pyplot as plt
+
+    my_sim = NCompSimulator(-0.2, 2.5, "data", verbose=True)
+
+    my_sim.calc_binodal()
+    b = np.load(my_sim.out_binod)
+    phi_d_den, phi_r_den, phi_d_dil, phi_r_dil = b.T
+    start_idx = 1
+    plt.scatter(phi_r_dil[start_idx:], phi_d_dil[start_idx:], s=1, color="blue")
+    plt.scatter(phi_r_den[start_idx:], phi_d_den[start_idx:], s=1, color="red")
+    plt.plot(b[start_idx:, [1, 3]].T, b[start_idx:, [0, 2]].T, color="black", alpha=0.1)
+    phi_d_den_spin, phi_d_dil_spin, phi_r_spin = my_sim.calc_spinodal()
+    plt.plot(phi_r_spin, phi_d_den_spin, color="red", linestyle="--")
+    plt.plot(phi_r_spin, phi_d_dil_spin, color="blue", linestyle="--")
+    plt.xlabel(r"$\phi_r$")
+    plt.ylabel(r"$\phi_d$")
+    plt.show()
