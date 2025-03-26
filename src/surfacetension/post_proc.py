@@ -17,7 +17,7 @@ class PostProcessor:
 
     COLOR_OPS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
-    def __init__(self, dir: str):
+    def __init__(self, dir: str, box_size: int):
         self.datasets = self.fetch_data(dir)
 
         # Iterate over all datasets which vary in interaction strengths
@@ -25,7 +25,9 @@ class PostProcessor:
 
             # Get simulator object to calculate thermodynamic quantities
             # Chis are off by a factor of 10 for readability
-            dataset["sim_obj"] = NCompSimulator(-chis[0] / 10, chis[1] / 10, dir)
+            dataset["sim_obj"] = NCompSimulator(
+                -chis[0] / 10, chis[1] / 10, box_size, dir
+            )
             dataset["phi_r_c"] = dataset["sim_obj"].find_phi_r_c()
 
             dataset["spinodal"] = dataset["sim_obj"].calc_spinodal()
@@ -33,6 +35,9 @@ class PostProcessor:
 
             # Phase concentrations in dilute and dense phase
             dataset["phase_phis"] = self.datasets[chis]["prof_eq"][:, :, [0, -1]]
+            dataset["phase_phis"] = dataset["phase_phis"].reshape(
+                len(dataset["phase_phis"]), -1
+            )
 
             surf_ten, del_f, surf_exc = self.calc_surface_tension_from_dataset(chis)
             dataset["surface_tension"] = surf_ten
@@ -99,13 +104,10 @@ class PostProcessor:
 
             # In general use `NCompSimulator` class for constant system parameters
             # and class instance `sim_obj` for everything else
-            x_if, phi_if = self.interp_if_pos(NCompSimulator.X_LIST, prof_eq_sample[0])
+            x_if, phi_if = self.interp_if_pos(sim_obj.x_list, prof_eq_sample[0])
 
             field_collection = pde.FieldCollection(
-                [
-                    pde.ScalarField(NCompSimulator.GRID, prof_eq_sample[i])
-                    for i in range(2)
-                ]
+                [pde.ScalarField(sim_obj.grid, prof_eq_sample[i]) for i in range(2)]
             )
 
             ###################################
@@ -117,7 +119,7 @@ class PostProcessor:
             # Hard interface free energy
             #                                   Concentrations in dilute phase
             f_hi = x_if * sim_obj.f.free_energy(prof_eq_sample[:, 0]) + (
-                NCompSimulator.L
+                sim_obj.box_size
                 - x_if
                 #                     Concentrations in dense phase
             ) * sim_obj.f.free_energy(prof_eq_sample[:, -1])
@@ -132,14 +134,14 @@ class PostProcessor:
                 sim_obj.pde.chemical_potential(field_collection).data, axis=-1
             )
 
-            phi_si_d = prof_eq_sample[0].sum() * NCompSimulator.L / NCompSimulator.N
-            phi_si_r = prof_eq_sample[1].sum() * NCompSimulator.L / NCompSimulator.N
+            phi_si_d = prof_eq_sample[0].sum() * sim_obj.box_size / NCompSimulator.N
+            phi_si_r = prof_eq_sample[1].sum() * sim_obj.box_size / NCompSimulator.N
 
             phi_hi_d = prof_eq_sample[0][0] * x_if + prof_eq_sample[0][-1] * (
-                NCompSimulator.L - x_if
+                sim_obj.box_size - x_if
             )
             phi_hi_r = prof_eq_sample[1][0] * x_if + prof_eq_sample[1][-1] * (
-                NCompSimulator.L - x_if
+                sim_obj.box_size - x_if
             )
 
             surface_excess[i] = (phi_si_d - phi_hi_d) * chem_pot[0] + (
@@ -211,7 +213,7 @@ class PostProcessor:
         """
         dataset = self.datasets[chis]
         surface_tension = dataset["surface_tension"]
-        phi_r_dil, phi_r_c = dataset["phase_phis"][:, 1, 0], dataset["phi_r_c"]
+        phi_r_dil, phi_r_c = dataset["phase_phis"][:, 2], dataset["phi_r_c"]
 
         idx_select = np.where(surface_tension > 2e-5)[0]
         surface_tension = surface_tension[idx_select][-6:]
@@ -241,7 +243,7 @@ class PostProcessor:
             # idx_select = np.where(surface_tension > 1e-6)[0]
 
             phi_r_dil, phi_r_c = (
-                dataset["phase_phis"][:, 1, 0],
+                dataset["phase_phis"][:, 2],
                 dataset["phi_r_c"],
             )
             a, b = dataset["power_law_fit"][0]
@@ -288,7 +290,7 @@ class PostProcessor:
         plt.figure(figsize=(8, 6))
         for i, prof in enumerate(prof_eq):
             plt.plot(
-                NCompSimulator.X_LIST,
+                sim_obj.x_list,
                 prof[1],
                 color=colormap(i / len(prof_eq)),
             )
@@ -298,6 +300,32 @@ class PostProcessor:
             r"$\chi_{dr} = %.1f, \chi_{ds} = %.1f$" % (-chis[0] / 10, chis[1] / 10)
         )
         # plt.savefig(f"profiles_dr{chis[0]}_ds{chis[1]}.png")
+        plt.show()
+
+    def plot_phase_diag(self, chis: tuple[float, float]):
+        """
+        Plot the phase diagram for a given (chi_dr, chi_ds) pair.
+
+        Parameters
+        ----------
+        chis : tuple[float, float]
+            The values of chi_dr and chi_ds.
+        """
+        dataset = self.datasets[chis]
+        phi_d_den_spin, phi_d_dil_spin, phi_r_spin = dataset["spinodal"]
+
+        phi_d_dil, phi_d_den, phi_r_dil, phi_r_den = dataset["phase_phis"].T
+        plt.figure(figsize=(8, 6))
+        plt.scatter(phi_r_dil, phi_d_dil, label="Dilute phase", color="blue")
+        plt.scatter(phi_r_den, phi_d_den, label="Dense phase", color="red")
+        plt.plot(
+            np.array([phi_r_den, phi_r_dil]),
+            np.array([phi_d_den, phi_d_dil]),
+            color="black",
+            alpha=0.1,
+        )
+        plt.plot(phi_r_spin, phi_d_dil_spin, color="blue", linestyle="--")
+        plt.plot(phi_r_spin, phi_d_den_spin, color="red", linestyle="--")
         plt.show()
 
     def plot_fit_params(self):
@@ -333,6 +361,7 @@ class PostProcessor:
 if __name__ == "__main__":
 
     post_proc = PostProcessor("data")
-    post_proc.plot_surface_tension()
-    post_proc.plot_fit_params()
+    # post_proc.plot_surface_tension()
+    # post_proc.plot_fit_params()
+    post_proc.plot_phase_diag((8, 25))
     # post_proc.plot_profiles((8, 30))

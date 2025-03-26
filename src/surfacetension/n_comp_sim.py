@@ -16,11 +16,8 @@ import flory
 
 class NCompSimulator:
     # System parameters
-    L = 400
     N = 128
     LMD = -4
-    GRID = pde.CartesianGrid([(0, L)], [N], periodic=False)
-    X_LIST = GRID.cell_coords.flatten()
 
     # Simulation parameters
     T_SIM = 1000000
@@ -28,7 +25,12 @@ class NCompSimulator:
     CONV_VALUE = [1e-9, 1e-9]  # MSD must be below this value for convergence
 
     def __init__(
-        self, chi_dr: float, chi_ds: float, out_dir: str, verbose: bool = False
+        self,
+        chi_dr: float,
+        chi_ds: float,
+        box_size: int,
+        out_dir: str,
+        verbose: bool = False,
     ):
         """
         This class simulates the three component system for a set of interaction parameters.
@@ -41,12 +43,19 @@ class NCompSimulator:
             Interaction parameter between the droplet and the regulator
         chi_ds : float
             Interaction parameter between the droplet and the solvent
+        box_size : int
+            Length of the simulation box
+        out_dir : str
+            Directory to save the simulation results
         verbose : bool, optional
             Print the progress of the simulation, by default False
 
         """
         self.verbose = verbose
 
+        self.box_size = box_size
+        self.grid = pde.CartesianGrid([(0, box_size)], [self.N], periodic=False)
+        self.x_list = self.grid.cell_coords.flatten()
         self.chi_dr = chi_dr
         self.chi_ds = chi_ds
         self.chi_matrix = np.array(
@@ -98,6 +107,9 @@ class NCompSimulator:
         self.msd_t = np.zeros((len(binodal_phis), 2, self.NUM_FRAMES))
 
         for i, phis_init in enumerate(binodal_phis):
+            if i < 25:
+                print(f"Warning: Skipping step {i}")
+                continue
 
             n = time.perf_counter()
             # Prevent getting stuck in a non-converging simulation
@@ -284,8 +296,8 @@ class NCompSimulator:
 
         field_init = pde.FieldCollection(
             [
-                pde.ScalarField(self.GRID, data=state_init[0], label="Droplet"),
-                pde.ScalarField(self.GRID, data=state_init[1], label="Regulator"),
+                pde.ScalarField(self.grid, data=state_init[0], label="Droplet"),
+                pde.ScalarField(self.grid, data=state_init[1], label="Regulator"),
             ]
         )
 
@@ -350,18 +362,11 @@ class NCompSimulator:
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    my_sim = NCompSimulator(-0.2, 2.5, "data", verbose=True)
+    NCompSimulator.L = 2400
+    NCompSimulator.GRID = pde.CartesianGrid(
+        [(0, NCompSimulator.L)], [NCompSimulator.N], periodic=False
+    )
+    NCompSimulator.x_list = NCompSimulator.GRID.cell_coords.flatten()
+    my_sim = NCompSimulator(-0.8, 2.5, "data/ll_box", verbose=True)
 
-    my_sim.calc_binodal()
-    b = np.load(my_sim.out_binod)
-    phi_d_den, phi_r_den, phi_d_dil, phi_r_dil = b.T
-    start_idx = 1
-    plt.scatter(phi_r_dil[start_idx:], phi_d_dil[start_idx:], s=1, color="blue")
-    plt.scatter(phi_r_den[start_idx:], phi_d_den[start_idx:], s=1, color="red")
-    plt.plot(b[start_idx:, [1, 3]].T, b[start_idx:, [0, 2]].T, color="black", alpha=0.1)
-    phi_d_den_spin, phi_d_dil_spin, phi_r_spin = my_sim.calc_spinodal()
-    plt.plot(phi_r_spin, phi_d_den_spin, color="red", linestyle="--")
-    plt.plot(phi_r_spin, phi_d_dil_spin, color="blue", linestyle="--")
-    plt.xlabel(r"$\phi_r$")
-    plt.ylabel(r"$\phi_d$")
-    plt.show()
+    my_sim.run()
