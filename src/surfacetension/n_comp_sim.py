@@ -2,11 +2,10 @@
 
 import time
 import os
-
+import warnings
 
 import numpy as np
 import scipy
-
 
 import pde
 from surfacetension.utils import mute_stdout
@@ -29,7 +28,7 @@ class NCompSimulator:
         chi_dr: float,
         chi_ds: float,
         box_size: int,
-        out_dir: str,
+        out_dir: str = None,
         verbose: bool = False,
     ):
         """
@@ -52,6 +51,7 @@ class NCompSimulator:
 
         """
         self.verbose = verbose
+        self.out_dir = out_dir
 
         self.box_size = box_size
         self.grid = pde.CartesianGrid([(0, box_size)], [self.N], periodic=False)
@@ -64,40 +64,42 @@ class NCompSimulator:
 
         self.f = phasesep.FloryHugginsNComponents(chis=self.chi_matrix, num_comp=3)
 
-        with mute_stdout():
-            self.pde = phasesep.CahnHilliardMultiplePDE(
-                {
-                    "free_energy": self.f,
-                    "kappa": self.LMD * self.chi_matrix,
-                    "regularize_after_step": True,
-                    "mobility_model": "scaled_correct",
-                }
+        self.pde = phasesep.CahnHilliardMultiplePDE(
+            {
+                "free_energy": self.f,
+                "kappa": self.LMD * self.chi_matrix,
+                "regularize_after_step": True,
+                "mobility_model": "scaled_correct",
+            }
+        )
+
+        if out_dir is not None:
+            # File path to save the simulation data
+            os.makedirs(os.path.join(out_dir, "sim_results"), exist_ok=True)
+            self.out_prof_eq = os.path.join(
+                out_dir,
+                "sim_results",
+                f"profEq_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy",
             )
-
-        # Good starting concentrations for the simulations near the spinodal
-        self.phi_d_den_spin, self.phi_d_dil_spin, self.phi_r_spin = self.calc_spinodal()
-
-        # File path to save the simulation data
-        os.makedirs(os.path.join(out_dir, "sim_results"), exist_ok=True)
-        self.out_prof_eq = os.path.join(
-            out_dir,
-            "sim_results",
-            f"profEq_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy",
-        )
-        # File path for average absolute difference of the profiles
-        self.out_msd = os.path.join(
-            out_dir, "sim_results", f"msd_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy"
-        )
-        # Cache binodal data for the given interaction parameters
-        os.makedirs(os.path.join(out_dir, "binodals"), exist_ok=True)
-        self.out_binod = os.path.join(
-            out_dir,
-            "binodals",
-            f"dr{abs(self.chi_dr*10):.0f}_ds{self.chi_ds*10:.0f}.npy",
-        )
+            # File path for average absolute difference of the profiles
+            self.out_msd = os.path.join(
+                out_dir,
+                "sim_results",
+                f"msd_dr{abs(chi_dr*10):.0f}_ds{chi_ds*10:.0f}.npy",
+            )
+            # Cache binodal data for the given interaction parameters
+            os.makedirs(os.path.join(out_dir, "binodals"), exist_ok=True)
+            self.out_binod = os.path.join(
+                out_dir,
+                "binodals",
+                f"dr{abs(self.chi_dr*10):.0f}_ds{self.chi_ds*10:.0f}.npy",
+            )
 
     def run(self):
         """Compute the binodal curve by simulating the system at different initial concentrations"""
+
+        if self.out_dir is None:
+            raise ValueError("Output directory is not defined")
 
         t_sim = self.T_SIM
 
@@ -107,9 +109,6 @@ class NCompSimulator:
         self.msd_t = np.zeros((len(binodal_phis), 2, self.NUM_FRAMES))
 
         for i, phis_init in enumerate(binodal_phis):
-            if i < 25:
-                print(f"Warning: Skipping step {i}")
-                continue
 
             n = time.perf_counter()
             # Prevent getting stuck in a non-converging simulation
@@ -210,8 +209,8 @@ class NCompSimulator:
             Binodal concentrations of the droplet and regulator in dense and dilute phase
         """
 
-        if os.path.exists(self.out_binod):
-            return np.load(self.out_binod)
+        # if os.path.exists(self.out_binod):
+        #     return np.load(self.out_binod)
 
         binodal_phis = np.empty((0, 4))
 
@@ -226,9 +225,7 @@ class NCompSimulator:
         count = 0
         while True:
             if count == 0:
-                phi_d = 0.5 * (self.phi_d_dil_spin[0] + self.phi_d_den_spin[0])
-                phi_r = self.phi_r_spin[0]
-                ensemble.phi_means = [phi_d, phi_r, 1 - phi_r - phi_d]
+                phis_next = np.array([0.5, 0.01])
 
             else:
                 # coordinates in dense and dilute phase of most recent binodal
@@ -241,10 +238,11 @@ class NCompSimulator:
                 # Vector orthogonal to tide line
                 v_orth = np.array([-v_pl[1], v_pl[0]])
                 phis_next = v_0 + l * v_orth
-                ensemble.phi_means = [*phis_next, 1 - phis_next.sum()]
+
+            ensemble.phi_means = [*phis_next, 1 - phis_next.sum()]
 
             finder.set_ensemble(ensemble)
-            phases = finder.run().get_clusters()
+            phases = finder.run(tolerance=1e-15).get_clusters()
 
             fracs = phases.fractions
 
@@ -362,11 +360,5 @@ class NCompSimulator:
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    NCompSimulator.L = 2400
-    NCompSimulator.GRID = pde.CartesianGrid(
-        [(0, NCompSimulator.L)], [NCompSimulator.N], periodic=False
-    )
-    NCompSimulator.x_list = NCompSimulator.GRID.cell_coords.flatten()
-    my_sim = NCompSimulator(-0.8, 2.5, "data/ll_box", verbose=True)
-
+    my_sim = NCompSimulator(-0.8, 2.5, 800, "data/ll_box", verbose=True)
     my_sim.run()
