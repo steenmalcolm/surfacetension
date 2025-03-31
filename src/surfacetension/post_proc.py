@@ -2,11 +2,15 @@ import re
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, root_scalar
 import pandas as pd
+import logging
+
 
 import pde
 from surfacetension import NCompSimulator
+
+logging.disable(logging.WARNING)
 
 
 # TODO: - Check how `phasesep.CahnHilliardMultiplePDE.free_energy` integrates numerically
@@ -35,12 +39,22 @@ class SimulationPostProcessor:
         self.msd = msd
         self.binodal_phis = binodal_phis
         self.figures_dir = figures_dir
-        self.sim_obj = NCompSimulator(-chi_dr / 10, chi_ds / 10, box_size)
+        self.sim_obj = NCompSimulator(self.chi_dr, self.chi_ds, box_size)
 
         # Phase concentrations in dilute and dense phase
         phase_phis = self.prof_eq[:, :, [0, -1]].reshape(len(prof_eq), -1)
         # Sort the concentrations in the order: [phi_d_den, phi_r_den, phi_d_dil, phi_r_dil]
         self.phase_phis = phase_phis[:, [1, 3, 0, 2]]
+
+        self.phi_r_spin_max = SimulationPostProcessor.calc_phi_r_max(
+            self.chi_dr, self.chi_ds
+        )
+        self.phi_r_c_list, self.is_inside = self.calc_critical_points()
+
+        self.surface_tension, self.del_free_energies, self.surface_excess = (
+            self.calc_surface_tension_from_dataset()
+        )
+        self.fit_params, self.fit_params_cov = self.fit_surface_tension()
 
         if figures_dir is not None:
 
@@ -59,7 +73,13 @@ class SimulationPostProcessor:
             )
             os.makedirs(self.phase_fig_dir, exist_ok=True)
 
-    def interp_if_pos(self, x: np.ndarray, phi_eq: np.ndarray) -> tuple[float, float]:
+            self.st_fig_dir = os.path.join(
+                self.figures_dir, f"box_size{self.box_size}", "surface_tension"
+            )
+            os.makedirs(self.st_fig_dir, exist_ok=True)
+
+    @staticmethod
+    def interp_if_pos(x: np.ndarray, phi_eq: np.ndarray) -> tuple[float, float]:
         """
         Interpolate the position of the interface.
 
@@ -86,18 +106,10 @@ class SimulationPostProcessor:
         return (x_if, phi_if)
 
     def calc_surface_tension_from_dataset(
-        self, chis: tuple[float, float]
+        self,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Calculte the difference free energy, surface excess
         and from this the surface tension.
-
-        Parameters
-        ----------
-        chis : tuple[float, float]
-            The values of chi_dr and chi_ds.
-
-        phi_r_idx : int
-            The index for the list of regulator concentrations.
 
         Returns
         -------
@@ -114,7 +126,9 @@ class SimulationPostProcessor:
 
             # In general use `NCompSimulator` class for constant system parameters
             # and class instance `sim_obj` for everything else
-            x_if, phi_if = self.interp_if_pos(self.sim_obj.x_list, prof_eq_sample[0])
+            x_if, _ = SimulationPostProcessor.interp_if_pos(
+                self.sim_obj.x_list, prof_eq_sample[0]
+            )
 
             field_collection = pde.FieldCollection(
                 [
@@ -176,35 +190,39 @@ class SimulationPostProcessor:
     def power_func(x, a, b):
         return a * x**b
 
-    def fit_surface_tension(self, chis: tuple[float, float]) -> tuple[float, float]:
+    def fit_surface_tension(self) -> tuple[float, float]:
         """
         Fit the surface tension to a power law.
-
-        Parameters
-        ----------
-        chis : tuple[float, float]
-            The values of chi_dr and chi_ds.
 
         Returns
         -------
         tuple[float, float]
             The parameters of the power law fit.
         """
-        pass
-        # phi_r_dil, phi_r_c =
+        phi_r_dil, phi_r_c = self.phase_phis[:, 3], self.phi_r_c_list[-1]
 
-        # idx_select = np.where(surface_tension > 2e-5)[0]
-        # surface_tension = surface_tension[idx_select][-6:]
-        # phi_r_dil = phi_r_dil[idx_select][-6:]
+        idx_select = np.where(phi_r_c - phi_r_dil > 0)[0]
+        surface_tension = self.surface_tension[idx_select][-6:]
+        phi_r_dil = phi_r_dil[idx_select][-6:]
 
-        # popt, pcov = curve_fit(
-        #     self.power_func,
-        #     phi_r_c - phi_r_dil,
-        #     surface_tension,
-        # )
-        # return popt, np.diag(pcov)
+        popt, pcov = curve_fit(self.power_func, phi_r_c - phi_r_dil, surface_tension)
+        return popt, np.diag(pcov)
 
-    def calc_phi_d_spin(self, phi_r: float, is_dense_phase: bool = False) -> float:
+    @staticmethod
+    def spinodal_coefficients(
+        phi_r: float, chi_dr: float, chi_ds: float
+    ) -> tuple[float, float]:
+        """Get p and q coefficients for the spinodal equation"""
+
+        q = 1 / (phi_r * (chi_dr - chi_ds) ** 2 + 2 * chi_ds)
+        p = phi_r - 1 - 2 * chi_dr * phi_r * q
+
+        return p, q
+
+    @staticmethod
+    def calc_phi_d_spin(
+        phi_r: float, chi_dr: float, chi_ds: float, is_dense_phase: bool = False
+    ) -> float:
         """
         Calculate the spinodal droplet concentration as a function of the regulator concentration
 
@@ -212,6 +230,10 @@ class SimulationPostProcessor:
         ----------
         phi_r : float
             Regulator concentration
+        chi_dr: float
+            Regulator coupling parameter
+        chi_ds: float
+            Droplet coupling parameter
         is_dense_phase : bool, optional
             Calculate the droplet concentration in the dense phase, by default False
 
@@ -220,68 +242,116 @@ class SimulationPostProcessor:
         float
             Droplet concentration
         """
-        q = 1 / (phi_r * (self.chi_dr - self.chi_ds) ** 2 + 2 * self.chi_ds)
-        p = phi_r - 1 - 2 * self.chi_dr * phi_r * q
+        p, q = SimulationPostProcessor.spinodal_coefficients(phi_r, chi_dr, chi_ds)
 
         if is_dense_phase:
             return -p / 2 + np.sqrt(p**2 / 4 - q)
         return -p / 2 - np.sqrt(p**2 / 4 - q)
 
-    def calc_critical_point(self, chis: tuple[float, float]) -> tuple[float, float]:
-        """
-        Calculate the critical point
+    @staticmethod
+    def calc_phi_r_max(chi_dr, chi_ds) -> float:
+        """Calculate the maximum regulator concentration for which phase separation occurs."""
 
-        Parameters
-        ----------
-        chis : tuple[float, float]
-            The values of chi_dr and chi_ds.
+        def func(phi_r):
+            p, q = SimulationPostProcessor.spinodal_coefficients(phi_r, chi_dr, chi_ds)
+            return p**2 - 4 * q
+
+        phi_r_spin_max = root_scalar(
+            func, bracket=[0.15, 0.4], method="brentq", xtol=1e-8
+        ).root
+        return phi_r_spin_max
+
+    def calc_deriv_phi_d_spin(self, phi_r: float, h=1e-8) -> float:
+        """
+        Calculate the derivative of the spinodal droplet concentration as a function of the regulator concentration
+        using finite differences.
+        """
+        return (
+            SimulationPostProcessor.calc_phi_d_spin(phi_r + h, self.chi_dr, self.chi_ds)
+            - SimulationPostProcessor.calc_phi_d_spin(
+                phi_r - h, self.chi_dr, self.chi_ds
+            )
+        ) / (2 * h)
+
+    def calc_critical_points(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Calculate the critical point by using the fact that the derivative of the spinodal droplet concentration
+        is the same as the slope of the tie line near the critical point.
+        For this use the six closest points to the critical point.
 
         Returns
         -------
         tuple[float, float]
-            The critical point.
+            phi_D and phi_R at the critical point
         """
-        pass
-        # phi_d_dil, phi_d_den =
+
+        if self.chi_dr == 0.0:
+            # If chi_dr = 0, the critical point is at the maximum regulator concentration
+            # and all tie lines are inside the spinodal
+            return np.ones((len(self.phase_phis),)) * self.phi_r_spin_max, np.ones(
+                (len(self.phase_phis),), dtype=bool
+            )
+
+        phi_d_den, phi_r_den, phi_d_dil, phi_r_dil = self.phase_phis.T
+        slopes_tie = (phi_d_den - phi_d_dil) / (phi_r_den - phi_r_dil)
+
+        def func(phi_r, deriv):
+
+            return self.calc_deriv_phi_d_spin(phi_r) - deriv
+
+        phi_r_c = np.empty(len(slopes_tie))
+
+        for i, slope in enumerate(slopes_tie[::-1]):
+            ir = len(slopes_tie) - 1 - i
+            if slope > 100:
+                phi_r_c[ir] = phi_r_c[ir + 1]
+                continue
+            phi_r_c[ir] = root_scalar(
+                func,
+                args=(slope,),
+                bracket=[0.2, self.phi_r_spin_max - 1e-6],
+                method="brentq",
+            ).root
+
+        # Cross product of displacement vectors between critical point
+        # and dense/dilute phase should be negative
+        phi_d_c = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_c, self.chi_dr, self.chi_ds
+        )
+        is_inside = (
+            (phi_r_den - phi_r_c) * (phi_d_dil - phi_d_c)
+            - (phi_d_den - phi_d_c) * (phi_r_dil - phi_r_c)
+        ) > 0
+
+        return phi_r_c, is_inside
 
     def plot_surface_tension(self):
         """
-        Plot the free energy of the system.
+        Plot the surface tension of the system.
         """
 
-        nsamples_plot = 3
-        rand_samp = np.random.choice(len(self.datasets), nsamples_plot)
-        plt.figure(figsize=(8, 6))
+        # Use critical point from tie line closest to spinodal
+        phi_r_c = self.phi_r_c_list[self.is_inside][-1]
+        # plt.figure(figsize=(8, 6))
 
-        for i, r in enumerate(rand_samp):
-            chis, dataset = list(self.datasets.items())[r]
+        # Only plot datapoints with tie lines inside the spinodal
+        phi_r_dil = self.phase_phis[self.is_inside, 3]
+        surface_tension = self.surface_tension[self.is_inside]
 
-            surface_tension = dataset["surface_tension"]
-            # Near the critical point some samples don't phase separate
-            # idx_select = np.where(surface_tension > 1e-6)[0]
-
-            phi_r_dil, phi_r_c = (
-                dataset["phase_phis"][:, 2],
-                dataset["phi_r_c"],
-            )
-            a, b = dataset["power_law_fit"][0]
-            st_fit = self.power_func(phi_r_c - phi_r_dil, a, b)
-            fit_idx = np.where(phi_r_c - phi_r_dil < 4e-2)[0]
-
-            plt.scatter(
-                phi_r_c - phi_r_dil,
-                surface_tension,
-                marker="o",
-                color=self.COLOR_OPS[i],
-                label=r"$\chi_{dr} = %.1f, \chi_{ds} = %.1f$"
-                % (-chis[0] / 10, chis[1] / 10),
-            )
-            plt.plot(
-                phi_r_c - phi_r_dil,
-                st_fit,
-                color=self.COLOR_OPS[i],
-                linestyle="--",
-            )
+        plt.scatter(
+            phi_r_c - phi_r_dil,
+            surface_tension,
+            marker="o",
+            facecolors="blue",
+            edgecolors="black",
+        )
+        plt.plot(
+            phi_r_c - phi_r_dil,
+            self.power_func(phi_r_c - phi_r_dil, *self.fit_params),
+            color="black",
+            linestyle="--",
+            label=r"$\propto (\phi_r - \phi_{r,dil})^{%.2f}$" % self.fit_params[1],
+        )
 
         plt.ylabel(r"$\gamma$")
         plt.xlabel(r"$\phi_r - \phi_{r,dil}$")
@@ -289,7 +359,12 @@ class SimulationPostProcessor:
         plt.yscale("log")
         plt.legend()
 
-        # plt.savefig("st_fit.png")
+        plt.savefig(
+            os.path.join(
+                self.st_fig_dir, f"dr{self.chi_dr_str}_ds{self.chi_ds_str}.png"
+            )
+        )
+        plt.close()
 
     def plot_profiles(self, is_droplet: bool = True):
         """
@@ -326,18 +401,29 @@ class SimulationPostProcessor:
         """
         Plot the phi_r vs phi_d phase diagram.
         """
-        phi_d_bin_den, phi_r_bin_den, phi_d_bin_dil, phi_r_bin_dil = self.binodal_phis.T
-        phi_r_spin = np.linspace(0, 0.5, 1000)
-        phi_d_den_spin = self.calc_phi_d_spin(phi_r_spin, is_dense_phase=True)
-        phi_r_spin = phi_r_spin[phi_d_den_spin > 0]
-        phi_d_den_spin = phi_d_den_spin[phi_d_den_spin > 0]
-        phi_d_dil_spin = self.calc_phi_d_spin(phi_r_spin)
+        phi_r_spin = np.linspace(0, self.phi_r_spin_max - 1e-7, 1000)
+        phi_d_den_spin = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_spin, self.chi_dr, self.chi_ds, is_dense_phase=True
+        )
+        phi_d_dil_spin = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_spin, self.chi_dr, self.chi_ds
+        )
 
         phi_d_den, phi_r_den, phi_d_dil, phi_r_dil = self.phase_phis.T
 
+        phi_r_c = self.phi_r_c_list
+        phi_d_c = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_c, self.chi_dr, self.chi_ds
+        )
+
         plt.figure(figsize=(8, 6))
-        plt.scatter(phi_r_bin_dil, phi_d_bin_dil, color="blue")
-        plt.scatter(phi_r_bin_den, phi_d_bin_den, label="Binodal", color="red")
+        plt.subplot(121)
+        plt.title(r"$\chi_{dr} = %.1f, \chi_{ds} = %.1f$" % (self.chi_dr, self.chi_ds))
+
+        plt.scatter(phi_r_dil, phi_d_dil, facecolors="blue", edgecolors="black")
+        plt.scatter(
+            phi_r_den, phi_d_den, label="Binodal", facecolors="blue", edgecolors="black"
+        )
         # Tie lines
         plt.plot(
             np.array([phi_r_den, phi_r_dil]),
@@ -345,28 +431,78 @@ class SimulationPostProcessor:
             color="black",
             alpha=0.1,
         )
-        # plt.scatter(phi_r_dil, phi_d_dil, color="blue")
-        # plt.scatter(phi_r_den, phi_d_den, label="Binodal", color="red")
-        # # Tie lines
-        # plt.plot(
-        #     np.array([phi_r_den, phi_r_dil]),
-        #     np.array([phi_d_den, phi_d_dil]),
-        #     color="black",
-        #     alpha=0.1,
-        # )
-        plt.plot(phi_r_spin, phi_d_dil_spin, color="blue", linestyle="--")
+        plt.plot(phi_r_spin, phi_d_dil_spin, color="orange", linestyle="--")
         plt.plot(
-            phi_r_spin, phi_d_den_spin, color="red", linestyle="--", label="Spinodal"
+            phi_r_spin, phi_d_den_spin, color="orange", linestyle="--", label="Spinodal"
+        )
+        plt.scatter(
+            phi_r_c[self.is_inside],
+            phi_d_c[self.is_inside],
+            color="black",
+            marker="x",
+            label="Critical points (inside)",
+        )
+        plt.scatter(
+            phi_r_c[~self.is_inside],
+            phi_d_c[~self.is_inside],
+            color="red",
+            marker="x",
+            label="Critical points (outside)",
         )
         plt.legend()
-        plt.xlabel(r"$\phi_r$")
-        plt.ylabel(r"$\phi_d$")
+        plt.xlabel(r"$\phi_R$")
+        plt.ylabel(r"$\phi_D$")
+
+        # Plot points near critical point
+        plt.subplot(122)
+
+        phi_r_den_spin = np.linspace(phi_r_den[-6], self.phi_r_spin_max - 1e-7, 1000)
+        phi_d_den_spin = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_den_spin, self.chi_dr, self.chi_ds, is_dense_phase=True
+        )
+        phi_r_dil_spin = np.linspace(phi_r_dil[-6], self.phi_r_spin_max - 1e-7, 1000)
+        phi_d_dil_spin = SimulationPostProcessor.calc_phi_d_spin(
+            phi_r_dil_spin, self.chi_dr, self.chi_ds
+        )
+        plt.plot(phi_r_dil_spin, phi_d_dil_spin, color="orange", linestyle="--")
+        plt.plot(phi_r_den_spin, phi_d_den_spin, color="orange", linestyle="--")
+        plt.scatter(
+            phi_r_dil[-6:], phi_d_dil[-6:], facecolors="blue", edgecolors="black"
+        )
+        plt.scatter(
+            phi_r_den[-6:], phi_d_den[-6:], facecolors="blue", edgecolors="black"
+        )
+        plt.plot(
+            np.array(
+                [phi_r_den[-6:], phi_r_dil[-6:]],
+            ),
+            np.array([phi_d_den[-6:], phi_d_dil[-6:]]),
+            color="black",
+            alpha=0.1,
+        )
+        plt.scatter(
+            phi_r_c[self.is_inside][-6:],
+            phi_d_c[self.is_inside][-6:],
+            color="black",
+            marker="x",
+        )
+        plt.scatter(
+            phi_r_c[~self.is_inside][-6:],
+            phi_d_c[~self.is_inside][-6:],
+            color="red",
+            marker="x",
+        )
+        plt.xlabel(r"$\phi_R$")
+        plt.tight_layout()
+
         plt.savefig(
             os.path.join(
                 self.phase_fig_dir,
                 f"dr{self.chi_dr_str}_ds{self.chi_ds_str}.png",
             )
         )
+        # if self.chi_dr < -0.5:
+        #     plt.show()
         plt.close()
 
     def plot_msd(self):
@@ -513,18 +649,58 @@ class PostProcessorCollection:
                             ),
                         ]
 
-    def plot_profiles(self):
-        for i, row in self.post_processors.iterrows():
+    def plot_fit_params(self, box_size: int):
+        """
+        Plot the fit parameters for all datasets.
+        Plot separate curves for each unique ds value.
+        """
+        crit_exp = {"25": [], "30": []}
+        crit_exp_dev = {"25": [], "30": []}
+        chis_dr = {"25": [], "30": []}
+
+        post_processors = self.post_processors[
+            self.post_processors["box_size"] == box_size
+        ]
+
+        for i, row in post_processors.iterrows():
             post_proc = row["post_processor"]
-            post_proc.plot_profiles()
+            crit_exp[post_proc.chi_ds_str].append(post_proc.fit_params[1])
+            crit_exp_dev[post_proc.chi_ds_str].append(
+                np.sqrt(post_proc.fit_params_cov[1])
+            )
+            chis_dr[post_proc.chi_ds_str].append(abs(post_proc.chi_dr))
+
+        plt.figure(figsize=(8, 6))
+        for chi_ds, crit_exps in crit_exp.items():
+            plt.errorbar(
+                chis_dr[chi_ds],
+                crit_exps,
+                yerr=crit_exp_dev[chi_ds],
+                fmt="o",
+                capsize=2,
+                ecolor="black",
+                label=r"$\chi_{ds} = %.1f$" % (float(chi_ds) / 10),
+            )
+        plt.legend()
+        plt.xlabel(r"$|\chi_{dr}|$")
+        plt.ylabel(r"$\delta$")
+        plt.title(r"$\gamma \propto (\phi_r - \phi_{r,dil})^{\delta}$")
+
+        plt.savefig(os.path.join(self.figures_dir, "crit_exp.png"))
+        plt.show()
+        plt.close()
 
 
 if __name__ == "__main__":
     post_proc_collection = PostProcessorCollection("data", "report/figures")
 
+    post_proc_collection.plot_fit_params(800)
     # Calculate surface tension for all datasets
     for i, row in post_proc_collection.post_processors.iterrows():
         post_proc = row["post_processor"]
-        post_proc.plot_profiles()
-        post_proc.plot_phase_diag()
-        post_proc.plot_msd()
+        # post_proc.plot_profiles()
+        # post_proc.plot_profiles(is_droplet=False)
+        # post_proc.plot_phase_diag()
+        # post_proc.plot_msd()
+        # post_proc.plot_surface_tension()
+#
